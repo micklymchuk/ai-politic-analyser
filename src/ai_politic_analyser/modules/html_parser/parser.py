@@ -39,11 +39,10 @@ class HTMLParser:
             'button', 'select', 'textarea', 'iframe', 'object', 'embed'
         }
         
-        # CSS classes that indicate technical/navigation content
+        # CSS classes that indicate technical/navigation content (exact matches only)
         self.technical_classes = {
             'nav', 'navigation', 'menu', 'sidebar', 'footer', 'header',
-            'advertisement', 'ad', 'social', 'share', 'breadcrumb',
-            'pagination', 'toolbar', 'controls', 'widget'
+            'advertisement', 'ad'
         }
         
         # Table indicators for content vs technical classification
@@ -102,59 +101,188 @@ class HTMLParser:
         for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
             comment.extract()
         
-        # Remove by technical classes
+        # Remove by technical classes (exact matches only)
         for class_name in self.technical_classes:
-            for element in soup.find_all(class_=lambda x: x and any(class_name in cls.lower() for cls in x)):
+            for element in soup.find_all(class_=lambda x: x and class_name in x):
                 element.decompose()
     
     def _extract_structured_content(self, soup: BeautifulSoup) -> str:
-        """Extract content with structural context labels."""
+        """Extract content with structural context labels using blacklist approach."""
         content_parts = []
         
         # Process body or main content area
         body = soup.find('body') or soup
         main_content = body.find('main') or body.find('article') or body
         
-        for element in main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'table', 'blockquote']):
-            if self._is_meaningful_element(element):
-                processed_content = self._process_element(element)
-                if processed_content:
-                    content_parts.append(processed_content)
+        # Process elements recursively, prioritizing top-level block elements
+        self._extract_content_recursive(main_content, content_parts, set())
         
         return '\n\n'.join(content_parts)
+    
+    def _extract_content_recursive(self, element: Tag, content_parts: list, processed_elements: set):
+        """Recursively extract content while preserving structure."""
+        if not isinstance(element, Tag) or id(element) in processed_elements:
+            return
+        
+        if self._is_technical_element(element):
+            return
+        
+        # Mark as processed to avoid duplicates
+        processed_elements.add(id(element))
+        
+        tag_name = element.name.lower() if element.name else ""
+        
+        # Handle specific structural elements with special formatting
+        if tag_name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            content = self._process_heading(element)
+            if content:
+                content_parts.append(content)
+            return
+        elif tag_name in ['ul', 'ol']:
+            content = self._process_list(element)
+            if content:
+                content_parts.append(content)
+            return
+        elif tag_name == 'table':
+            content = self._process_table(element)
+            if content:
+                content_parts.append(content)
+            return
+        elif tag_name == 'blockquote':
+            content = self._process_quote(element)
+            if content:
+                content_parts.append(content)
+            return
+        elif tag_name == 'p':
+            content = self._process_paragraph(element)
+            if content:
+                content_parts.append(content)
+            return
+        
+        # For other elements, check if they contain meaningful direct text
+        direct_text = ""
+        has_block_children = False
+        
+        for child in element.children:
+            if isinstance(child, NavigableString):
+                text = str(child).strip()
+                if text:
+                    direct_text += text + " "
+            elif isinstance(child, Tag):
+                child_tag = child.name.lower()
+                # Check if child is a block-level element
+                if child_tag in ['div', 'p', 'section', 'article', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'table', 'blockquote']:
+                    has_block_children = True
+                    # Process child recursively
+                    self._extract_content_recursive(child, content_parts, processed_elements)
+        
+        # If element has direct meaningful text and no block children, add it as content
+        if direct_text.strip() and len(direct_text.strip()) >= 10 and not has_block_children:
+            content_parts.append(direct_text.strip())
+        elif not has_block_children:
+            # If no block children, extract all text content as a block
+            text_content = element.get_text(strip=True)
+            if text_content and len(text_content) >= 10:
+                content_parts.append(text_content)
+    
+    def _has_processed_parent(self, element: Tag, processed_elements: set) -> bool:
+        """Check if any parent of this element has already been processed."""
+        parent = element.parent
+        while parent and hasattr(parent, 'name'):
+            if id(parent) in processed_elements:
+                return True
+            parent = parent.parent
+        return False
+    
+    def _is_technical_element(self, element: Tag) -> bool:
+        """Check if element is a technical/non-content element that should be excluded."""
+        if not isinstance(element, Tag):
+            return False
+        
+        tag_name = element.name.lower()
+        
+        # Check if it's a technical tag (these were already removed, but double-check)
+        if tag_name in self.remove_elements:
+            return True
+        
+        # Check for technical classes (exact matches only)
+        element_classes = element.get('class', [])
+        if any(tech_class in element_classes for tech_class in self.technical_classes):
+            return True
+        
+        return False
     
     def _is_meaningful_element(self, element: Tag) -> bool:
         """Check if element contains meaningful content."""
         if not isinstance(element, Tag):
             return False
         
-        # Check if element has been removed or is empty
-        if not element.get_text(strip=True):
-            return False
-        
-        # Check for technical classes
-        element_classes = element.get('class', [])
-        if any(tech_class in ' '.join(element_classes).lower() for tech_class in self.technical_classes):
-            return False
-        
-        # Minimum content length threshold
+        # Check if element has meaningful text content
         text_content = element.get_text(strip=True)
-        return len(text_content) > 10
+        if not text_content or len(text_content) < 10:
+            return False
+        
+        # Check if element has any child elements that we might want to process
+        # Skip if all children are already processed (avoid duplicate processing)
+        return True
     
     def _process_element(self, element: Tag) -> Optional[str]:
         """Process individual elements with contextual labels."""
         tag_name = element.name.lower()
         
+        # Process specific structural elements with special formatting
         if tag_name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
             return self._process_heading(element)
-        elif tag_name == 'p':
-            return self._process_paragraph(element)
         elif tag_name in ['ul', 'ol']:
             return self._process_list(element)
         elif tag_name == 'table':
             return self._process_table(element)
         elif tag_name == 'blockquote':
             return self._process_quote(element)
+        elif tag_name == 'p':
+            return self._process_paragraph(element)
+        else:
+            # For all other block-level elements, process them with structure preservation
+            return self._process_generic_block(element)
+        
+        return None
+    
+    def _process_generic_block(self, element: Tag) -> Optional[str]:
+        """Process generic block elements while preserving internal structure."""
+        tag_name = element.name.lower()
+        
+        # Define block-level elements that should have their content processed with structure
+        block_elements = {
+            'div', 'section', 'article', 'main', 'header', 'aside', 'span',
+            'figure', 'figcaption', 'details', 'summary'
+        }
+        
+        if tag_name in block_elements:
+            # For block elements, process child text nodes and elements separately
+            content_parts = []
+            
+            # Get direct text content and child elements
+            for child in element.children:
+                if isinstance(child, NavigableString):
+                    # Direct text content
+                    text = str(child).strip()
+                    if text and len(text) >= 10:
+                        content_parts.append(text)
+                elif isinstance(child, Tag):
+                    # Child elements - check if they contain meaningful content
+                    child_text = child.get_text(strip=True)
+                    if child_text and len(child_text) >= 10:
+                        # For nested elements, extract structured content
+                        if child.name.lower() in ['p', 'div', 'span', 'section']:
+                            content_parts.append(child_text)
+            
+            if content_parts:
+                return '\n\n'.join(content_parts)
+        else:
+            # For inline or other elements, just extract text
+            text = element.get_text(strip=True)
+            if text and len(text) >= 10:
+                return text
         
         return None
     
